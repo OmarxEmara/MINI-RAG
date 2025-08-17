@@ -1,3 +1,4 @@
+import time
 from fastapi import FastAPI, APIRouter, status, Request
 from fastapi.responses import JSONResponse
 from routes.schemes.nlp import PushRequest, SearchRequest
@@ -6,7 +7,7 @@ from models.ChunkModel import ChunkModel
 from controllers import NLPController
 from models import ResponseSignal
 from tqdm.auto import tqdm
-
+import time
 import logging
 
 logger = logging.getLogger('uvicorn.error')
@@ -38,7 +39,8 @@ async def index_project(request: Request, project_id: int, push_request: PushReq
                 "signal": ResponseSignal.PROJECT_NOT_FOUND_ERROR.value
             }
         )
-    
+    end_time   = time.time()
+    sss = end_time - start_time
     nlp_controller = NLPController(
         vectordb_client=request.app.vectordb_client,
         generation_client=request.app.generation_client,
@@ -166,7 +168,8 @@ async def search_index(request: Request, project_id: int, search_request: Search
 
 @nlp_router.post("/index/answer/{project_id}")
 async def answer_rag(request: Request, project_id: int, search_request: SearchRequest):
-    
+    start_time = time.time()
+
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
     )
@@ -188,6 +191,9 @@ async def answer_rag(request: Request, project_id: int, search_request: SearchRe
         limit=search_request.limit,
     )
 
+    end_time = time.time()
+    response_time = end_time - start_time
+
     if not answer:
         return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -201,6 +207,7 @@ async def answer_rag(request: Request, project_id: int, search_request: SearchRe
             "signal": ResponseSignal.RAG_ANSWER_SUCCESS.value,
             "answer": answer,
             "full_prompt": full_prompt,
-            "chat_history": chat_history
+            "chat_history": chat_history,
+            "response_time": response_time,
         }
     )
