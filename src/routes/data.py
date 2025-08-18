@@ -13,6 +13,16 @@ from models.AssetModel import AssetModel
 from models.db_schemes import DataChunk, Asset
 from models.enums.AssetTypeEnum import AssetTypeEnum
 from controllers import NLPController
+from utils.deps import get_current_user
+from utils.org_access import get_project_org_id
+from utils.org_access import OrgAccessControl
+import requests
+from bs4 import BeautifulSoup
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+import uuid
+
+
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -81,6 +91,101 @@ async def upload_data(request: Request, project_id: int, file: UploadFile,
                 "file_id": str(asset_record.asset_id),
             }
         )
+
+
+
+@data_router.post("/scrape/{project_id}")
+async def scrape_url(request: Request, project_id: int, url: str,
+                     app_settings: Settings = Depends(get_settings)):
+
+    project_model = await ProjectModel.create_instance(
+        db_client=request.app.db_client
+    )
+
+    project = await project_model.get_project_or_create_one(
+        project_id=project_id
+    )
+
+    # scrape the url with headers to avoid 403
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/114.0.0.0 Safari/537.36"
+            )
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"Error while scraping URL: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"signal": "SCRAPE_FAILED", "error": str(e)}
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # remove unwanted tags
+    for script in soup(["script", "style"]):
+        script.decompose()
+    page_text = soup.get_text(separator="\n", strip=True)
+
+    # create project folder if not exists
+    project_dir_path = ProjectController().get_project_path(project_id=project_id)
+    os.makedirs(project_dir_path, exist_ok=True)
+
+    # unique pdf file name
+    file_id = f"{uuid.uuid4().hex}.pdf"
+    file_path = os.path.join(project_dir_path, file_id)
+
+    # save content to PDF
+    try:
+        pdf = canvas.Canvas(file_path, pagesize=letter)
+        pdf.setFont("Helvetica", 10)
+        width, height = letter
+        y = height - 40
+        for line in page_text.splitlines():
+            if y <= 40:  # start new page if overflow
+                pdf.showPage()
+                pdf.setFont("Helvetica", 10)
+                y = height - 40
+            pdf.drawString(40, y, line[:1000])  # truncate long lines
+            y -= 15
+        pdf.save()
+    except Exception as e:
+        logger.error(f"Error while saving PDF: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"signal": "PDF_SAVE_FAILED", "error": str(e)}
+        )
+
+    # store the asset into db
+    asset_model = await AssetModel.create_instance(
+        db_client=request.app.db_client
+    )
+
+    asset_resource = Asset(
+        asset_project_id=project.project_id,
+        asset_type=AssetTypeEnum.FILE.value,
+        asset_name=file_id,
+        asset_size=os.path.getsize(file_path)
+    )
+
+    asset_record = await asset_model.create_asset(asset=asset_resource)
+
+    return JSONResponse(
+        content={
+            "signal": "SCRAPE_SUCCESS",
+            "file_id": asset_record.asset_name,
+            "url": url
+        }
+    )
+
+
+
+
+
 
 
 @data_router.post("/process/{project_id}")

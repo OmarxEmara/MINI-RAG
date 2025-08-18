@@ -125,6 +125,14 @@ def save_feedback(project_id: str, answer_id: str, feedback: int):
 @nlp_router.post("/index/push/{project_id}")
 async def index_project(request: Request, project_id: int, push_request: PushRequest):
 
+    """
+    Batch-index a project's chunks into the vector DB.
+    - Creates the collection (optionally reset).
+    - Streams through chunks with pagination.
+    - Returns total inserted count.
+    """
+    start_time = time.time()
+
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
     )
@@ -142,6 +150,10 @@ async def index_project(request: Request, project_id: int, push_request: PushReq
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"signal": ResponseSignal.PROJECT_NOT_FOUND_ERROR.value}
         )
+    
+    end_time   = time.time()
+    sss = end_time - start_time  # kept from original code 
+
     
     nlp_controller = NLPController(
         vectordb_client=request.app.vectordb_client,
@@ -168,7 +180,7 @@ async def index_project(request: Request, project_id: int, push_request: PushReq
     pbar = tqdm(total=total_chunks_count, desc="Vector Indexing", position=0)
 
     while has_records:
-        page_chunks = await chunk_model.get_project_chunks(project_id=project.project_id, page_no=page_no)
+        page_chunks = await chunk_model.get_poject_chunks(project_id=project.project_id, page_no=page_no)
         if len(page_chunks):
             page_no += 1
 
@@ -267,8 +279,22 @@ async def search_index(request: Request, project_id: int, search_request: Search
     )
 
 @nlp_router.post("/index/answer/{project_id}")
-async def answer_rag(request: Request, project_id: int, search_request: SearchRequest):
+async def answer_rag(
+    request: Request,
+    project_id: int,
+    search_request: SearchRequest,
+):
+    """
+    Generate a RAG answer for the given query and return:
+      - answer (text), full_prompt, chat_history
+      - response_time (seconds)
+      - answer_id + audio_url to play the same answer later
+    """
+    start_time = time.time()
     
+
+
+
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
     )
@@ -298,6 +324,11 @@ async def answer_rag(request: Request, project_id: int, search_request: SearchRe
             content={"signal": ResponseSignal.RAG_ANSWER_ERROR.value}
         )
     
+
+    answer_id = cache_put_answer(request.app, project_id, answer)
+    audio_url = f"/api/v1/nlp/index/answer/audio/{project_id}?answer_id={answer_id}"
+
+    
     return JSONResponse(
         content={
             "signal": ResponseSignal.RAG_ANSWER_SUCCESS.value,
@@ -309,3 +340,78 @@ async def answer_rag(request: Request, project_id: int, search_request: SearchRe
             "audio_url": audio_url,
         }
     )
+
+
+
+
+@nlp_router.get("/index/answer/audio/{project_id}")
+async def answer_rag_audio_get(
+    request: Request,
+    project_id: int,
+    answer_id: str,
+):
+    """
+    Speak a previously generated answer by its answer_id.
+    - Reads from in-memory cache; does not re-run RAG.
+    - Returns a seekable MP3 (works in Swagger/browser players).
+    """
+    start_time = time.time()
+
+    # Swagger sometimes includes quotes around string params
+    answer_id = answer_id.strip().strip('"').strip("'")
+
+    project_model = await ProjectModel.create_instance(db_client=request.app.db_client)
+    _ = await project_model.get_project_or_create_one(project_id=project_id)
+
+    # Retrieve the exact same answer text we returned in POST
+    answer = cache_get_answer(request.app, answer_id)
+    if answer is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"signal": "ANSWER_ID_NOT_FOUND_OR_EXPIRED"}
+        )
+
+    # gTTS is blocking; run in a thread so we don't block the event loop
+    loop = asyncio.get_running_loop()
+    mp3_bytes = await loop.run_in_executor(None, partial(_gtts_mp3_bytes, answer))
+
+    # Write to a temp file so browsers/Swagger can perform HTTP Range requests
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp.write(mp3_bytes)
+    tmp.flush(); tmp.close()
+
+    # Use ASCII-safe headers (preview is base64) to avoid Unicode header errors
+    preview_b64 = base64.b64encode(answer[:120].encode("utf-8")).decode("ascii")
+    headers = {
+        "X-Response-Time": str(round(time.time() - start_time, 4)),
+        "X-Answer-Preview-Base64": preview_b64,
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": 'inline; filename="answer.mp3"',
+    }
+
+    # Delete the temp file after the response is sent
+    cleanup = BackgroundTask(lambda: os.remove(tmp.name))
+
+    return FileResponse(
+        tmp.name,
+        media_type="audio/mpeg",
+        headers=headers,
+        background=cleanup,
+    )
+
+
+
+
+
+
+@nlp_router.post("/index/answer/feedback/{project_id}")
+async def give_feedback(project_id: str, feedback_request: FeedbackRequest):
+    answer_id = feedback_request.answer_id
+    feedback = feedback_request.feedback
+
+    if feedback not in [0, 1]:
+        return {"error": "Feedback must be 0 or 1"}
+
+    save_feedback(project_id, answer_id, feedback)
+
+    return {"message": "Feedback saved successfully", "project_id": project_id, "answer_id": answer_id, "feedback": feedback}
