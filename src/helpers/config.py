@@ -40,6 +40,11 @@ class Settings(BaseSettings):
 
     PRIMARY_LANG: str = "en"
     DEFAULT_LANG: str = "en"
+#authentication
+    JWT_SECRET: str = "1357912468abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"       # set via .env in prod
+    JWT_ALG: str = "HS256"
+    ACCESS_TTL_MIN: int = 15
+    REFRESH_TTL_DAYS: int = 30
 
     class Config:
         env_file = ".env"

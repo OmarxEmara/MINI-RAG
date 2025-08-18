@@ -13,6 +13,9 @@ from models.AssetModel import AssetModel
 from models.db_schemes import DataChunk, Asset
 from models.enums.AssetTypeEnum import AssetTypeEnum
 from controllers import NLPController
+from fastapi import HTTPException
+from utils.deps import require_access_to_project, get_current_user
+from utils.org_access import OrgAccessControl, get_project_org_id
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -22,9 +25,25 @@ data_router = APIRouter(
 )
 
 @data_router.post("/upload/{project_id}")
-async def upload_data(request: Request, project_id: int, file: UploadFile,
-                      app_settings: Settings = Depends(get_settings)):
-        
+async def upload_data(
+    request: Request, 
+    project_id: int, 
+    file: UploadFile,
+    app_settings: Settings = Depends(get_settings),
+    user: dict = Depends(get_current_user)
+):
+    """Upload data file - requires admin access to project's organization"""
+    
+    # Get project and verify organization access
+    project_org_id = await get_project_org_id(request.app.db_client, project_id)
+    if project_org_id is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"signal": "PROJECT_NOT_FOUND"}
+        )
+    
+    # Require admin access for file uploads
+    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=True)
     
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
@@ -34,17 +53,14 @@ async def upload_data(request: Request, project_id: int, file: UploadFile,
         project_id=project_id
     )
 
-    # validate the file properties
+    # Validate the file properties
     data_controller = DataController()
-
     is_valid, result_signal = data_controller.validate_uploaded_file(file=file)
 
     if not is_valid:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "signal": result_signal
-            }
+            content={"signal": result_signal}
         )
 
     project_dir_path = ProjectController().get_project_path(project_id=project_id)
@@ -58,17 +74,13 @@ async def upload_data(request: Request, project_id: int, file: UploadFile,
             while chunk := await file.read(app_settings.FILE_DEFAULT_CHUNK_SIZE):
                 await f.write(chunk)
     except Exception as e:
-
         logger.error(f"Error while uploading file: {e}")
-
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "signal": ResponseSignal.FILE_UPLOAD_FAILED.value
-            }
+            content={"signal": ResponseSignal.FILE_UPLOAD_FAILED.value}
         )
 
-    # store the assets into the database
+    # Store the assets into the database
     asset_model = await AssetModel.create_instance(
         db_client=request.app.db_client
     )
@@ -83,15 +95,33 @@ async def upload_data(request: Request, project_id: int, file: UploadFile,
     asset_record = await asset_model.create_asset(asset=asset_resource)
 
     return JSONResponse(
-            content={
-                "signal": ResponseSignal.FILE_UPLOAD_SUCCESS.value,
-                "file_id": str(asset_record.asset_id),
-            }
-        )
+        content={
+            "signal": ResponseSignal.FILE_UPLOAD_SUCCESS.value,
+            "file_id": str(asset_record.asset_id),
+        }
+    )
+
 
 @data_router.post("/process/{project_id}")
-async def process_endpoint(request: Request, project_id: int, process_request: ProcessRequest):
-
+async def process_endpoint(
+    request: Request, 
+    project_id: int, 
+    process_request: ProcessRequest,
+    user: dict = Depends(get_current_user)
+):
+    """Process data files - requires admin access to project's organization"""
+    
+    # Get project and verify organization access
+    project_org_id = await get_project_org_id(request.app.db_client, project_id)
+    if project_org_id is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"signal": "PROJECT_NOT_FOUND"}
+        )
+    
+    # Require admin access for processing
+    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=True)
+    
     chunk_size = process_request.chunk_size
     overlap_size = process_request.overlap_size
     do_reset = process_request.do_reset
@@ -112,8 +142,8 @@ async def process_endpoint(request: Request, project_id: int, process_request: P
     )
 
     asset_model = await AssetModel.create_instance(
-            db_client=request.app.db_client
-        )
+        db_client=request.app.db_client
+    )
 
     project_files_ids = {}
     if process_request.file_id:
@@ -125,18 +155,14 @@ async def process_endpoint(request: Request, project_id: int, process_request: P
         if asset_record is None:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "signal": ResponseSignal.FILE_ID_ERROR.value,
-                }
+                content={"signal": ResponseSignal.FILE_ID_ERROR.value}
             )
 
         project_files_ids = {
             asset_record.asset_id: asset_record.asset_name
         }
-    
-    else:
-        
 
+    else:
         project_files = await asset_model.get_all_project_assets(
             asset_project_id=project.project_id,
             asset_type=AssetTypeEnum.FILE.value,
@@ -150,32 +176,29 @@ async def process_endpoint(request: Request, project_id: int, process_request: P
     if len(project_files_ids) == 0:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "signal": ResponseSignal.NO_FILES_ERROR.value,
-            }
+            content={"signal": ResponseSignal.NO_FILES_ERROR.value}
         )
-    
+
     process_controller = ProcessController(project_id=project_id)
 
     no_records = 0
     no_files = 0
 
     chunk_model = await ChunkModel.create_instance(
-                        db_client=request.app.db_client
-                    )
+        db_client=request.app.db_client
+    )
 
     if do_reset == 1:
-        # delete associated vectors collection
+        # Delete associated vectors collection
         collection_name = nlp_controller.create_collection_name(project_id=project.project_id)
         _ = await request.app.vectordb_client.delete_collection(collection_name=collection_name)
 
-        # delete associated chunks
+        # Delete associated chunks
         _ = await chunk_model.delete_chunks_by_project_id(
             project_id=project.project_id
         )
 
     for asset_id, file_id in project_files_ids.items():
-
         file_content = process_controller.get_file_content(file_id=file_id)
 
         if file_content is None:
@@ -192,16 +215,14 @@ async def process_endpoint(request: Request, project_id: int, process_request: P
         if file_chunks is None or len(file_chunks) == 0:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "signal": ResponseSignal.PROCESSING_FAILED.value
-                }
+                content={"signal": ResponseSignal.PROCESSING_FAILED.value}
             )
 
         file_chunks_records = [
             DataChunk(
                 chunk_text=chunk.page_content,
                 chunk_metadata=chunk.metadata,
-                chunk_order=i+1,
+                chunk_order=i + 1,
                 chunk_project_id=project.project_id,
                 chunk_asset_id=asset_id
             )
@@ -216,5 +237,94 @@ async def process_endpoint(request: Request, project_id: int, process_request: P
             "signal": ResponseSignal.PROCESSING_SUCCESS.value,
             "inserted_chunks": no_records,
             "processed_files": no_files
+        }
+    )
+
+
+@data_router.delete("/assets/{project_id}/{asset_id}")
+async def delete_asset(
+    request: Request,
+    project_id: int,
+    asset_id: int,
+    user: dict = Depends(get_current_user)
+):
+    """Delete an asset - requires admin access to project's organization"""
+    
+    # Get project and verify organization access
+    project_org_id = await get_project_org_id(request.app.db_client, project_id)
+    if project_org_id is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"signal": "PROJECT_NOT_FOUND"}
+        )
+    
+    # Require admin access for deletion
+    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=True)
+    
+    asset_model = await AssetModel.create_instance(
+        db_client=request.app.db_client
+    )
+    
+    # Verify asset belongs to project
+    asset_record = await asset_model.get_asset_by_id(asset_id)
+    if not asset_record or asset_record.asset_project_id != project_id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"signal": "ASSET_NOT_FOUND"}
+        )
+    
+    # Delete the asset
+    success = await asset_model.delete_asset(asset_id)
+    if not success:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"signal": "ASSET_DELETE_FAILED"}
+        )
+    
+    return JSONResponse(
+        content={"signal": "ASSET_DELETED_SUCCESS"}
+    )
+
+
+@data_router.get("/assets/{project_id}")
+async def list_project_assets(
+    request: Request,
+    project_id: int,
+    user: dict = Depends(get_current_user)
+):
+    """List project assets - requires access to project's organization"""
+    
+    # Get project and verify organization access
+    project_org_id = await get_project_org_id(request.app.db_client, project_id)
+    if project_org_id is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"signal": "PROJECT_NOT_FOUND"}
+        )
+    
+    # Users can view assets in their organization
+    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=False)
+    
+    asset_model = await AssetModel.create_instance(
+        db_client=request.app.db_client
+    )
+    
+    assets = await asset_model.get_all_project_assets(
+        asset_project_id=project_id,
+        asset_type=AssetTypeEnum.FILE.value
+    )
+    
+    return JSONResponse(
+        content={
+            "signal": "ASSETS_RETRIEVED_SUCCESS",
+            "assets": [
+                {
+                    "asset_id": asset.asset_id,
+                    "asset_name": asset.asset_name,
+                    "asset_size": asset.asset_size,
+                    "created_at": asset.created_at.isoformat() if hasattr(asset, 'created_at') else None
+                }
+                for asset in assets
+            ]
         }
     )
