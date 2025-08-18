@@ -37,3 +37,7 @@ beautifulsoup4==4.12.2
 reportlab
 
 gtts==2.3.0
+
+paddlex==3.0.0
+paddleocr
+paddlepaddle

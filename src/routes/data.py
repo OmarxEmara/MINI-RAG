@@ -21,8 +21,7 @@ from bs4 import BeautifulSoup
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import uuid
-
-
+from paddleocr import PaddleOCR
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -185,6 +184,111 @@ async def scrape_url(request: Request, project_id: int, url: str,
 
 
 
+
+# Initialize PaddleOCR once (supports multi-language: en, fr, ar, etc.)
+ocr = PaddleOCR(lang='en')
+
+
+@data_router.post("/ocr/{project_id}")
+async def ocr_image(
+    request: Request,
+    project_id: int,
+    file: UploadFile,
+    app_settings: Settings = Depends(get_settings)
+):
+    """Extract text from uploaded image/PDF using PaddleOCR and save as PDF"""
+
+    project_model = await ProjectModel.create_instance(
+        db_client=request.app.db_client
+    )
+    project = await project_model.get_project_or_create_one(
+        project_id=project_id
+    )
+
+    # Create project dir if not exists
+    project_dir_path = ProjectController().get_project_path(project_id=project_id)
+    os.makedirs(project_dir_path, exist_ok=True)
+
+    # Save uploaded file temporarily
+    temp_file_path = os.path.join(project_dir_path, f"temp_{uuid.uuid4().hex}_{file.filename}")
+    try:
+        async with aiofiles.open(temp_file_path, "wb") as f:
+            while chunk := await file.read(app_settings.FILE_DEFAULT_CHUNK_SIZE):
+                await f.write(chunk)
+    except Exception as e:
+        logger.error(f"Error saving uploaded file for OCR: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"signal": "OCR_FILE_SAVE_FAILED", "error": str(e)}
+        )
+
+    # Run OCR
+    try:
+        results = ocr.ocr(temp_file_path, cls=True)
+    except Exception as e:
+        logger.error(f"OCR extraction failed: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"signal": "OCR_FAILED", "error": str(e)}
+        )
+
+    extracted_text = []
+    if results and len(results) > 0:
+        for line in results[0]:
+            text = line[1][0]  # Extract recognized text
+            extracted_text.append(text)
+
+    # Save OCR text to PDF
+    file_id = f"{uuid.uuid4().hex}.pdf"
+    file_path = os.path.join(project_dir_path, file_id)
+
+    try:
+        pdf = canvas.Canvas(file_path, pagesize=letter)
+        pdf.setFont("Helvetica", 10)
+        width, height = letter
+        y = height - 40
+        for line in extracted_text:
+            if y <= 40:
+                pdf.showPage()
+                pdf.setFont("Helvetica", 10)
+                y = height - 40
+            pdf.drawString(40, y, line[:1000])
+            y -= 15
+        pdf.save()
+    except Exception as e:
+        logger.error(f"Error saving OCR PDF: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"signal": "PDF_SAVE_FAILED", "error": str(e)}
+        )
+
+    # Save asset in DB
+    asset_model = await AssetModel.create_instance(
+        db_client=request.app.db_client
+    )
+
+    asset_resource = Asset(
+        asset_project_id=project.project_id,
+        asset_type=AssetTypeEnum.FILE.value,
+        asset_name=file_id,
+        asset_size=os.path.getsize(file_path)
+    )
+
+    asset_record = await asset_model.create_asset(asset=asset_resource)
+
+    # Clean up temp file
+    try:
+        os.remove(temp_file_path)
+    except Exception:
+        pass
+
+    return JSONResponse(
+        content={
+            "signal": "OCR_SUCCESS",
+            "file_id": asset_record.asset_name,
+            "original_filename": file.filename
+        }
+    )
 
 
 
