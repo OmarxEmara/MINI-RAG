@@ -9,6 +9,11 @@ from models import ResponseSignal
 from tqdm.auto import tqdm
 import time
 import logging
+import os
+import json
+import uuid
+from fastapi import APIRouter, Request
+from pydantic import BaseModel
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -34,6 +39,12 @@ nlp_router = APIRouter(
     prefix="/api/v1/nlp",
     tags=["api_v1", "nlp"],
 )
+
+#############################################
+
+class FeedbackRequest(BaseModel):
+    answer_id: str
+    feedback: int  # 0 or 1
 
 # =============================================================================
 # Answer cache (answer_id -> {project_id, answer, ts})
@@ -89,6 +100,23 @@ def _gtts_mp3_bytes(text: str, lang: Optional[str] = None) -> bytes:
     buf = io.BytesIO()
     gTTS(text=text, lang=lang, slow=False, tld="com").write_to_fp(buf)
     return buf.getvalue()
+
+# ===== Utility to save feedback locally =====
+def save_feedback(project_id: str, answer_id: str, feedback: int):
+    filename = f"feedback_{project_id}.json"
+    data = []
+
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+
+    data.append({"answer_id": answer_id, "feedback": feedback})
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 # =============================================================================
 # Indexing endpoints
@@ -359,3 +387,15 @@ async def answer_rag_audio_get(
         headers=headers,
         background=cleanup,
     )
+
+@nlp_router.post("/index/answer/feedback/{project_id}")
+async def give_feedback(project_id: str, feedback_request: FeedbackRequest):
+    answer_id = feedback_request.answer_id
+    feedback = feedback_request.feedback
+
+    if feedback not in [0, 1]:
+        return {"error": "Feedback must be 0 or 1"}
+
+    save_feedback(project_id, answer_id, feedback)
+
+    return {"message": "Feedback saved successfully", "project_id": project_id, "answer_id": answer_id, "feedback": feedback}
