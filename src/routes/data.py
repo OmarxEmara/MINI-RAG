@@ -13,9 +13,6 @@ from models.AssetModel import AssetModel
 from models.db_schemes import DataChunk, Asset
 from models.enums.AssetTypeEnum import AssetTypeEnum
 from controllers import NLPController
-from fastapi import HTTPException
-from utils.deps import require_access_to_project, get_current_user
-from utils.org_access import OrgAccessControl, get_project_org_id
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -25,25 +22,9 @@ data_router = APIRouter(
 )
 
 @data_router.post("/upload/{project_id}")
-async def upload_data(
-    request: Request, 
-    project_id: int, 
-    file: UploadFile,
-    app_settings: Settings = Depends(get_settings),
-    user: dict = Depends(get_current_user)
-):
-    """Upload data file - requires admin access to project's organization"""
-    
-    # Get project and verify organization access
-    project_org_id = await get_project_org_id(request.app.db_client, project_id)
-    if project_org_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"signal": "PROJECT_NOT_FOUND"}
-        )
-    
-    # Require admin access for file uploads
-    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=True)
+async def upload_data(request: Request, project_id: int, file: UploadFile,
+                      app_settings: Settings = Depends(get_settings)):
+        
     
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
@@ -95,11 +76,11 @@ async def upload_data(
     asset_record = await asset_model.create_asset(asset=asset_resource)
 
     return JSONResponse(
-        content={
-            "signal": ResponseSignal.FILE_UPLOAD_SUCCESS.value,
-            "file_id": str(asset_record.asset_id),
-        }
-    )
+            content={
+                "signal": ResponseSignal.FILE_UPLOAD_SUCCESS.value,
+                "file_id": str(asset_record.asset_id),
+            }
+        )
 
 
 @data_router.post("/process/{project_id}")

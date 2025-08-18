@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, status, Request, Depends
+from fastapi import FastAPI, APIRouter, status, Request
 from fastapi.responses import JSONResponse
 from routes.schemes.nlp import PushRequest, SearchRequest
 from models.ProjectModel import ProjectModel
@@ -8,36 +8,123 @@ from models import ResponseSignal
 from utils.deps import get_current_user
 from utils.org_access import OrgAccessControl, get_project_org_id
 from tqdm.auto import tqdm
-
+import time
 import logging
+import os
+import json
+import uuid
+from fastapi import APIRouter, Request
+from pydantic import BaseModel
 
 logger = logging.getLogger('uvicorn.error')
+
+# -----------------------------------------------------------------------------
+# Media / TTS utilities and helpers
+# -----------------------------------------------------------------------------
+from fastapi.responses import FileResponse
+import asyncio, io, tempfile
+from functools import partial
+from gtts import gTTS
+
+# Response header safety + temp-file cleanup
+import os
+import base64
+from starlette.background import BackgroundTask
+
+# In-memory answer cache + small helpers
+from typing import Optional, Dict, Any
+from uuid import uuid4
+import re
 
 nlp_router = APIRouter(
     prefix="/api/v1/nlp",
     tags=["api_v1", "nlp"],
 )
 
+#############################################
+
+class FeedbackRequest(BaseModel):
+    answer_id: str
+    feedback: int  # 0 or 1
+
+# =============================================================================
+# Answer cache (answer_id -> {project_id, answer, ts})
+#  - Enables “ask once, play later” flow for audio without re-querying RAG.
+#  - Short-lived to avoid memory growth.
+# =============================================================================
+TTL_SECONDS = 600  # keep answers for 10 minutes
+
+def _get_cache(app) -> Dict[str, Any]:
+    """Return the process-local cache stored on app.state."""
+    if not hasattr(app.state, "answer_cache"):
+        app.state.answer_cache = {}
+    return app.state.answer_cache
+
+def _purge_expired(app) -> None:
+    """Drop expired cache entries based on TTL."""
+    cache = _get_cache(app)
+    now = time.time()
+    for k in list(cache.keys()):
+        if now - cache[k]["ts"] > TTL_SECONDS:
+            cache.pop(k, None)
+
+def cache_put_answer(app, project_id: int, answer: str) -> str:
+    """Store an answer and return its generated answer_id."""
+    _purge_expired(app)
+    answer_id = str(uuid4())
+    _get_cache(app)[answer_id] = {"project_id": project_id, "answer": answer, "ts": time.time()}
+    return answer_id
+
+def cache_get_answer(app, answer_id: str) -> Optional[str]:
+    """Fetch a previously stored answer by ID, or None if missing/expired."""
+    _purge_expired(app)
+    item = _get_cache(app).get(answer_id)
+    if not item:
+        return None
+    return item["answer"]
+
+# =============================================================================
+# Language detection and TTS
+#  - Simple heuristic: Arabic characters -> "ar", else "en".
+#  - gTTS synthesis returns MP3 bytes in-memory.
+# =============================================================================
+def _detect_lang(text: str) -> str:
+    """Very simple language heuristic: Arabic block -> 'ar', else 'en'."""
+    if re.search(r'[\u0600-\u06FF]', text):
+        return "ar"
+    return "en"
+
+def _gtts_mp3_bytes(text: str, lang: Optional[str] = None) -> bytes:
+    """Synthesize text to MP3 using gTTS; auto-select Arabic/English when not specified."""
+    if not lang:
+        lang = _detect_lang(text)
+    buf = io.BytesIO()
+    gTTS(text=text, lang=lang, slow=False, tld="com").write_to_fp(buf)
+    return buf.getvalue()
+
+# ===== Utility to save feedback locally =====
+def save_feedback(project_id: str, answer_id: str, feedback: int):
+    filename = f"feedback_{project_id}.json"
+    data = []
+
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+
+    data.append({"answer_id": answer_id, "feedback": feedback})
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# =============================================================================
+# Indexing endpoints
+# =============================================================================
 @nlp_router.post("/index/push/{project_id}")
-async def index_project(
-    request: Request, 
-    project_id: int, 
-    push_request: PushRequest,
-    user: dict = Depends(get_current_user)
-):
-    """Index project - requires admin access to project's organization"""
-    
-    # Get project and verify organization access
-    project_org_id = await get_project_org_id(request.app.db_client, project_id)
-    if project_org_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"signal": "PROJECT_NOT_FOUND"}
-        )
-    
-    # Require admin access for indexing
-    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=True)
-    
+async def index_project(request: Request, project_id: int, push_request: PushRequest):
+
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
     )
@@ -55,7 +142,7 @@ async def index_project(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"signal": ResponseSignal.PROJECT_NOT_FOUND_ERROR.value}
         )
-
+    
     nlp_controller = NLPController(
         vectordb_client=request.app.vectordb_client,
         generation_client=request.app.generation_client,
@@ -68,16 +155,15 @@ async def index_project(
     inserted_items_count = 0
     idx = 0
 
-    # Create collection if not exists
+    # create collection if not exists
     collection_name = nlp_controller.create_collection_name(project_id=project.project_id)
-
     _ = await request.app.vectordb_client.create_collection(
         collection_name=collection_name,
         embedding_size=request.app.embedding_client.embedding_size,
         do_reset=push_request.do_reset,
     )
 
-    # Setup batching
+    # setup batching
     total_chunks_count = await chunk_model.get_total_chunks_count(project_id=project.project_id)
     pbar = tqdm(total=total_chunks_count, desc="Vector Indexing", position=0)
 
@@ -98,7 +184,6 @@ async def index_project(
             chunks=page_chunks,
             chunks_ids=chunks_ids
         )
-
         if not is_inserted:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -117,23 +202,7 @@ async def index_project(
 
 
 @nlp_router.get("/index/info/{project_id}")
-async def get_project_index_info(
-    request: Request, 
-    project_id: int,
-    user: dict = Depends(get_current_user)
-):
-    """Get project index info - requires access to project's organization"""
-    
-    # Get project and verify organization access
-    project_org_id = await get_project_org_id(request.app.db_client, project_id)
-    if project_org_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"signal": "PROJECT_NOT_FOUND"}
-        )
-    
-    # Users can view index info in their organization
-    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=False)
+async def get_project_index_info(request: Request, project_id: int):
     
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
@@ -161,24 +230,7 @@ async def get_project_index_info(
 
 
 @nlp_router.post("/index/search/{project_id}")
-async def search_index(
-    request: Request, 
-    project_id: int, 
-    search_request: SearchRequest,
-    user: dict = Depends(get_current_user)
-):
-    """Search project index - requires access to project's organization"""
-    
-    # Get project and verify organization access
-    project_org_id = await get_project_org_id(request.app.db_client, project_id)
-    if project_org_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"signal": "PROJECT_NOT_FOUND"}
-        )
-    
-    # Users can search in their organization
-    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=False)
+async def search_index(request: Request, project_id: int, search_request: SearchRequest):
     
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
@@ -201,10 +253,12 @@ async def search_index(
 
     if not results:
         return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"signal": ResponseSignal.VECTORDB_SEARCH_ERROR.value}
-        )
-
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "signal": ResponseSignal.VECTORDB_SEARCH_ERROR.value
+                }
+            )
+    
     return JSONResponse(
         content={
             "signal": ResponseSignal.VECTORDB_SEARCH_SUCCESS.value,
@@ -212,26 +266,8 @@ async def search_index(
         }
     )
 
-
 @nlp_router.post("/index/answer/{project_id}")
-async def answer_rag(
-    request: Request, 
-    project_id: int, 
-    search_request: SearchRequest,
-    user: dict = Depends(get_current_user)
-):
-    """Get RAG answer - requires access to project's organization"""
-    
-    # Get project and verify organization access
-    project_org_id = await get_project_org_id(request.app.db_client, project_id)
-    if project_org_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"signal": "PROJECT_NOT_FOUND"}
-        )
-    
-    # Users can get answers from their organization
-    OrgAccessControl.validate_project_access(user, project_org_id, require_admin=False)
+async def answer_rag(request: Request, project_id: int, search_request: SearchRequest):
     
     project_model = await ProjectModel.create_instance(
         db_client=request.app.db_client
@@ -254,17 +290,22 @@ async def answer_rag(
         limit=search_request.limit,
     )
 
+    response_time = round(time.time() - start_time, 4)
+
     if not answer:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"signal": ResponseSignal.RAG_ANSWER_ERROR.value}
         )
-
+    
     return JSONResponse(
         content={
             "signal": ResponseSignal.RAG_ANSWER_SUCCESS.value,
             "answer": answer,
             "full_prompt": full_prompt,
-            "chat_history": chat_history
+            "chat_history": chat_history,
+            "response_time": response_time,
+            "answer_id": answer_id,
+            "audio_url": audio_url,
         }
     )

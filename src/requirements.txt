@@ -31,3 +31,9 @@ bcrypt
 psycopg2-binary 
 PyJWT
 passlib[argon2,bcrypt]
+
+beautifulsoup4==4.12.2
+
+reportlab
+
+gtts==2.3.0
