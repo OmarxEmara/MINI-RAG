@@ -3,7 +3,7 @@ from models.db_schemes import Project, DataChunk
 from stores.llm.LLMEnums import DocumentTypeEnum
 from typing import List
 import json
-
+#refactor controllers
 class NLPController(BaseController):
 
     def __init__(self, vectordb_client, generation_client, 

@@ -19,8 +19,6 @@ class Settings(BaseSettings):
 
     GENERATION_BACKEND: str
     EMBEDDING_BACKEND: str
-
-    OPENAI_API_KEY: str = None
     OPENAI_API_URL: str = None
     COHERE_API_KEY: str = None
 
@@ -41,10 +39,22 @@ class Settings(BaseSettings):
     PRIMARY_LANG: str = "en"
     DEFAULT_LANG: str = "en"
 #authentication
-    JWT_SECRET: str = "1357912468abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"       # set via .env in prod
+    JWT_SECRET: str = "1357912468abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"       # set via .env in prod dont write it in the config
     JWT_ALG: str = "HS256"
     ACCESS_TTL_MIN: int = 15
     REFRESH_TTL_DAYS: int = 30
+#mail sending
+    INVITE_TOKEN_HMAC_SECRET: str = "CHANGE_ME_LONG_RANDOM"
+    INVITE_TTL_HOURS: int = 48
+
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    EMAIL_FROM: str = "MiniRAG <no-reply@example.com>"
+
+    BACKEND_BASE_URL: str = "http://localhost:8000"  # for links if no frontend yet
+    FRONTEND_BASE_URL: str = ""  # leave empty if backend-only for now
 
     class Config:
         env_file = ".env"
